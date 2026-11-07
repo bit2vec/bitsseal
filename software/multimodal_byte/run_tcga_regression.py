@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""TCGA regression: predict patient age at diagnosis (20..90).
+
+Target: age in years (raw; standardized on the training set).
+Modalities: text + structured (age field stripped) + gene_top + cancer_type.
+Metrics: RMSE, MAE, Pearson r, Spearman rho on the raw age scale.
+Privacy: FILM, TAG.
+"""
+import argparse, functools, json, os, random, re, sys, time
+from collections import Counter
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(THIS_DIR, '..', '..'))
+sys.path.insert(0, THIS_DIR)
+sys.path.insert(0, os.path.join(ROOT, 'software', 'Senti_analysis'))
+sys.path.insert(0, os.path.join(ROOT, 'software', 'healthcare'))
+
+from tcga_loader import load_tcga_pan5
+from run_civic_extended import MultiModalClassifier
+from run_civic_multimodal import PAD, UNK, SEP, tokenize
+
+
+MODALITIES = [
+    ('text',         32),
+    ('structured',   32),
+    ('gene_top',     64),
+    ('cancer_type',   1),
+]
+
+
+AGE_RE = re.compile(r'(?:^|\s)age=\d+', flags=re.IGNORECASE)
+
+
+def strip_age(s):
+    return AGE_RE.sub('', s).strip()
+
+
+def load_tcga_regression():
+    examples, _ = load_tcga_pan5()
+    out = []
+    for ex in examples:
+        m = re.search(r'\bage=(\d+)', ex['structured'])
+        if not m: continue
+        age = int(m.group(1))
+        if age < 18 or age > 100: continue
+        out.append({
+            'text':        ex['text'],
+            'structured':  strip_age(ex['structured']),
+            'gene_top':    ex['gene_top'],
+            'cancer_type': ex['label'],
+            'age':         float(age),
+        })
+    rng = random.Random(42); rng.shuffle(out)
+    return out
+
+
+class TCGARegDataset(Dataset):
+    def __init__(self, exs, stoi, mods, y_mean, y_std):
+        self.exs = exs; self.stoi = stoi; self.mods = mods
+        self.y_mean = y_mean; self.y_std = y_std
+
+    def __len__(self): return len(self.exs)
+
+    def __getitem__(self, i):
+        ex = self.exs[i]
+        ids = []
+        for mod, budget in self.mods:
+            toks = tokenize(str(ex.get(mod, '')))
+            tok_ids = [self.stoi.get(t, self.stoi[UNK]) for t in toks]
+            if len(tok_ids) > budget: tok_ids = tok_ids[:budget]
+            else: tok_ids = tok_ids + [self.stoi[PAD]] * (budget - len(tok_ids))
+            ids.append(self.stoi[f'{SEP}_{mod}'])
+            ids.extend(tok_ids)
+        y = (ex['age'] - self.y_mean) / max(self.y_std, 1e-6)
+        return torch.tensor(ids, dtype=torch.long), float(y)
+
+
+def reg_collate(batch, pad_index=0):
+    if not batch: return None
+    ids = [b[0] for b in batch]
+    L = max(x.size(0) for x in ids)
+    ids_p = torch.full((len(ids), L), pad_index, dtype=torch.long)
+    for i, x in enumerate(ids): ids_p[i, :x.size(0)] = x
+    y = torch.tensor([b[1] for b in batch], dtype=torch.float32)
+    return {'ids': ids_p, 'label': y}
+
+
+def film_attack(model, ids, criterion, target_y, device, vocab_size):
+    model.zero_grad(set_to_none=False)
+    pred = model(ids.to(device)).squeeze(-1)
+    loss = criterion(pred, target_y.to(device))
+    loss.backward()
+    actual = set(int(t) for t in ids.flatten().tolist() if t > 0)
+    if model.method == 'standard':
+        gnorm = model.embedding.weight.grad.detach().norm(dim=1).cpu()
+        thr = gnorm.max().item() * 0.05 if gnorm.max().item() > 0 else 1e-12
+        recovered = set((gnorm > thr).nonzero(as_tuple=True)[0].tolist())
+    else:
+        recovered = set(range(vocab_size))
+        if len(recovered) > 5 * len(actual):
+            recovered = set(random.sample(list(recovered), min(20, len(recovered))))
+    tp = len(recovered & actual)
+    p = tp / max(len(recovered), 1); r = tp / max(len(actual), 1)
+    return 2 * p * r / max(p + r, 1e-9)
+
+
+def tag_attack(model, ids, criterion, target_y, device, vocab_size):
+    model.zero_grad(set_to_none=False)
+    pred = model(ids.to(device)).squeeze(-1)
+    loss = criterion(pred, target_y.to(device))
+    loss.backward()
+    actual = set(int(t) for t in ids.flatten().tolist() if t > 0)
+    if model.method == 'standard':
+        gnorm = model.embedding.weight.grad.detach().norm(dim=1).cpu()
+        k = max(len(actual), 1)
+        recovered = set(torch.topk(gnorm, k).indices.tolist())
+    else:
+        rows = []
+        with torch.no_grad():
+            for s in range(0, vocab_size, 2048):
+                e = min(s + 2048, vocab_size)
+                ids_v = torch.arange(s, e, device=device).unsqueeze(0)
+                rows.append(model.embedding(ids_v).squeeze(0))
+        emb_table = torch.cat(rows, dim=0)
+        fc_grad = model.fc.weight.grad.detach()
+        g = fc_grad.mean(dim=0).unsqueeze(0)
+        sim = (torch.nn.functional.normalize(g, dim=-1) @
+               torch.nn.functional.normalize(emb_table, dim=-1).t()).abs().squeeze(0).cpu()
+        k = max(len(actual), 1)
+        recovered = set(torch.topk(sim, k).indices.tolist())
+    tp = len(recovered & actual)
+    p = tp / max(len(recovered), 1); r = tp / max(len(actual), 1)
+    return 2 * p * r / max(p + r, 1e-9)
+
+
+def metrics(pred, y):
+    pred = np.asarray(pred); y = np.asarray(y)
+    rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
+    mae = float(np.mean(np.abs(pred - y)))
+    pearson = float(np.corrcoef(pred, y)[0, 1]) if pred.std() > 1e-9 and y.std() > 1e-9 else 0.0
+    rp = np.argsort(np.argsort(pred)); ry = np.argsort(np.argsort(y))
+    spearman = float(np.corrcoef(rp, ry)[0, 1]) if rp.std() > 1e-9 and ry.std() > 1e-9 else 0.0
+    return rmse, mae, pearson, spearman
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--out_dir', default='results/tcga_regression')
+    p.add_argument('--n_epochs', type=int, default=8)
+    p.add_argument('--methods', nargs='+', default=['standard', 'byte_seb'])
+    p.add_argument('--n_attack', type=int, default=12)
+    args = p.parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    print('Loading TCGA regression (age)...')
+    examples = load_tcga_regression()
+    ages = np.array([e['age'] for e in examples])
+    print(f'  {len(examples)} examples')
+    print(f'  age min={ages.min():.0f} max={ages.max():.0f} mean={ages.mean():.1f}')
+
+    n = len(examples)
+    n_tr = int(0.7 * n); n_va = int(0.1 * n)
+    train_ex = examples[:n_tr]; val_ex = examples[n_tr:n_tr + n_va]
+    test_ex = examples[n_tr + n_va:]
+
+    y_train = np.array([e['age'] for e in train_ex])
+    y_mean, y_std = float(y_train.mean()), float(y_train.std())
+    print(f'  Train age: mean={y_mean:.2f} std={y_std:.2f}')
+
+    counter = Counter()
+    for ex in train_ex:
+        for mod, _ in MODALITIES:
+            counter.update(tokenize(str(ex.get(mod, ''))))
+    stoi = {PAD: 0, UNK: 1}
+    for mod, _ in MODALITIES: stoi[f'{SEP}_{mod}'] = len(stoi)
+    for tok, c in counter.most_common():
+        if c >= 2: stoi[tok] = len(stoi)
+    vocab_size = len(stoi)
+    print(f'  vocab={vocab_size}  train={len(train_ex)} val={len(val_ex)} test={len(test_ex)}')
+
+    summary = {}
+    for method in args.methods:
+        print(f'\n>>> {method}')
+        _s=int(os.environ.get('RSEED','42')); random.seed(_s); np.random.seed(_s); torch.manual_seed(_s)
+        if torch.cuda.is_available(): torch.cuda.manual_seed(_s)
+        coll = functools.partial(reg_collate, pad_index=stoi[PAD])
+        bs = 16
+        train_ds = TCGARegDataset(train_ex, stoi, MODALITIES, y_mean, y_std)
+        val_ds = TCGARegDataset(val_ex, stoi, MODALITIES, y_mean, y_std)
+        test_ds = TCGARegDataset(test_ex, stoi, MODALITIES, y_mean, y_std)
+        tr = DataLoader(train_ds, batch_size=bs, shuffle=True, collate_fn=coll)
+        val_l = DataLoader(val_ds, batch_size=bs, shuffle=False, collate_fn=coll)
+        test_l = DataLoader(test_ds, batch_size=bs, shuffle=False, collate_fn=coll)
+
+        model = MultiModalClassifier(vocab_size, 64, 1,
+                                     method=method, body_kind='D',
+                                     pad_idx=stoi[PAD]).to(device)
+        opt = optim.Adam(model.parameters(), lr=5e-4)
+        crit = nn.MSELoss()
+
+        t0 = time.time()
+        best_val_rmse, best_state = float('inf'), None
+        for ep in range(args.n_epochs):
+            model.train()
+            for batch in tr:
+                if batch is None: continue
+                opt.zero_grad()
+                p_pred = model(batch['ids'].to(device)).squeeze(-1)
+                crit(p_pred, batch['label'].to(device)).backward()
+                opt.step()
+            model.eval()
+            preds, ys = [], []
+            with torch.no_grad():
+                for batch in val_l:
+                    if batch is None: continue
+                    p_pred = model(batch['ids'].to(device)).squeeze(-1).cpu().numpy()
+                    preds.extend(p_pred.tolist())
+                    ys.extend(batch['label'].cpu().numpy().tolist())
+            preds_raw = np.array(preds) * y_std + y_mean
+            ys_raw = np.array(ys) * y_std + y_mean
+            v_rmse, v_mae, v_p, v_s = metrics(preds_raw, ys_raw)
+            print(f'  ep {ep+1}: val RMSE={v_rmse:.3f} MAE={v_mae:.3f} '
+                  f'r={v_p:.3f} rho={v_s:.3f}')
+            if v_rmse < best_val_rmse:
+                best_val_rmse = v_rmse
+                best_state = {k: vv.clone() for k, vv in model.state_dict().items()}
+        if best_state is not None: model.load_state_dict(best_state)
+        train_time = time.time() - t0
+
+        model.eval()
+        preds, ys = [], []
+        t0 = time.time()
+        with torch.no_grad():
+            for batch in test_l:
+                if batch is None: continue
+                p_pred = model(batch['ids'].to(device)).squeeze(-1).cpu().numpy()
+                preds.extend(p_pred.tolist())
+                ys.extend(batch['label'].cpu().numpy().tolist())
+        inf_time = time.time() - t0
+        preds_raw = np.array(preds) * y_std + y_mean
+        ys_raw = np.array(ys) * y_std + y_mean
+        rmse, mae, pearson, spearman = metrics(preds_raw, ys_raw)
+
+        model.train()
+        film_f1s, tag_f1s = [], []
+        n_atk = 0
+        for batch in tr:
+            if batch is None or n_atk >= args.n_attack: break
+            try: film_f1s.append(film_attack(model, batch['ids'], crit,
+                                             batch['label'], device, vocab_size))
+            except Exception as e: print(f'  film err: {e}')
+            try: tag_f1s.append(tag_attack(model, batch['ids'], crit,
+                                           batch['label'], device, vocab_size))
+            except Exception as e: print(f'  tag err: {e}')
+            n_atk += 1
+
+        r = {
+            'method': method,
+            'val_rmse': float(best_val_rmse),
+            'test_rmse': rmse, 'test_mae': mae,
+            'test_pearson': pearson, 'test_spearman': spearman,
+            'n_params': sum(p.numel() for p in model.parameters()),
+            'vocab_size': vocab_size,
+            'train_time_s': train_time, 'inference_time_s': inf_time,
+            'film_f1': float(np.mean(film_f1s)) if film_f1s else 0.0,
+            'tag_f1':  float(np.mean(tag_f1s))  if tag_f1s  else 0.0,
+        }
+        summary[method] = r
+        print(f'  test RMSE={rmse:.3f} MAE={mae:.3f} r={pearson:.3f} rho={spearman:.3f}  '
+              f'FILM={r["film_f1"]:.3f} TAG={r["tag_f1"]:.3f}  params={r["n_params"]}')
+
+        with open(os.path.join(args.out_dir, 'summary.json'), 'w') as f:
+            json.dump(summary, f, indent=2)
+    print(f'\nWrote {args.out_dir}/summary.json')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,28 @@
+# Binary SEB FILM Attack Experiment Requirements
+# Install with: pip install -r requirements.txt
+
+# Core ML
+torch>=2.0.0
+numpy>=1.24.0
+
+# Hugging Face
+transformers>=4.36.0
+datasets>=2.16.0
+tokenizers>=0.15.0
+
+# Evaluation
+rouge-score>=0.1.2
+
+# Memory tracking
+psutil>=5.9.0
+
+# Utilities
+tqdm>=4.65.0
+pandas>=2.0.0
+
+# Visualization (optional)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Fairseq (optional, for using with Fairseq transformer)
+# fairseq>=0.12.0

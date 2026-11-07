@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.npy
+*.gz
+*.log
+results/
+*cache*/
+.hf_token
+.DS_Store
+nohup.out
